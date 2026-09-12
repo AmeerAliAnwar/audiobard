@@ -65,6 +65,12 @@ const hasAnyIncomplete = computed(() => {
   return books.value.some((b) => b.has_audio === false)
 })
 
+function getBookAudioUrl(bookId: number): string {
+  const base = `http://127.0.0.1:8000/book/${bookId}/download`
+  const folder = settingsStore.settings.outputFolder
+  return folder ? `${base}?output_folder=${encodeURIComponent(folder)}` : base
+}
+
 async function onDownload(book: LibraryBook) {
   try {
     const outputFolder = settingsStore.settings.outputFolder || undefined
@@ -217,7 +223,7 @@ onMounted(() => {
           <audio 
             v-if="book.has_audio !== false"
             controls 
-            :src="`http://127.0.0.1:8000/book/${book.id}/download`" 
+            :src="getBookAudioUrl(book.id)" 
             preload="none" 
             class="h-8 max-w-[200px] outline-none"
           ></audio>

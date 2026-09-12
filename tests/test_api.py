@@ -642,10 +642,13 @@ def test_delete_book_custom_output_folder(
     assert not audio_file.exists()
 
 
-def test_regenerate_book_custom_output_folder(
-    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.asyncio
+async def test_regenerate_book_custom_output_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """POST /book/{id}/regenerate saves output to custom output directory."""
+    from audiobard.api import regenerate_book
+
     source_file = tmp_path / "book.epub"
     source_file.write_bytes(b"epub-content")
     custom_dir = tmp_path / "custom_output"
@@ -664,14 +667,21 @@ def test_regenerate_book_custom_output_folder(
         "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 1 else None
     )
 
+    captured_out: list[Path] = []
+
+    async def _capture_run(src: Path, out: Path, **kwargs: Any) -> None:
+        captured_out.append(out)
+
     fake_pipeline = MagicMock()
-    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+    fake_pipeline.run = AsyncMock(side_effect=_capture_run)
 
     with (
         patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
         patch("audiobard.api.AudioBardConfig"),
     ):
-        r = client.post("/book/1/regenerate", json={"output_folder": str(custom_dir)})
+        result = await regenerate_book(1, {"output_folder": str(custom_dir)})
+        await asyncio.sleep(0.05)
 
-    assert r.status_code == 200
-    assert r.json()["status"] == "started"
+    assert result["status"] == "started"
+    assert len(captured_out) == 1
+    assert captured_out[0].resolve() == (custom_dir / "book.mp3").resolve()
