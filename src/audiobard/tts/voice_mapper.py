@@ -3,19 +3,29 @@
 Algorithm
 ---------
 1. Load the voice pool for the configured locale (``data/voices/en_US.json``).
-2. For each :class:`~audiobard.models.Character`:
+2. For whole-roster assignment (:meth:`VoiceMapper.assign_all`):
+   a. Order unmapped characters by candidate pool constraint
+      (most constrained pool first, tie-broken by ``canonical_id``). This ensures
+      rare demographic matches are assigned first and produces identical results
+      regardless of input roster permutation.
+3. For each :class:`~audiobard.models.Character`:
    a. Filter the pool by ``gender_hint`` (mandatory).
    b. Further filter by ``age_hint`` (best-effort; fall back to gender-filtered pool if empty).
    c. Score remaining candidates by cosine similarity of the tone vector.
-   d. Deterministic tie-break: ``zlib.crc32(canonical_id) % len(candidate_pool)``,
-      stable across processes (built-in ``hash()`` is salted per process).
-   e. If even the gender-filtered pool is empty, assign from the full pool
-      via the same hash tie-break and log a warning.
-3. Save the resulting mapping to ``voice_mapping.json`` (versioned).
+   d. Prioritize voice uniqueness: candidates not yet assigned in the current
+      mapping (``_mapping``) are selected from the highest available similarity
+      tier. If all matching candidates are already assigned, voices are reused
+      from the top similarity tier.
+   e. Deterministic tie-break: candidates within a tier are sorted by
+      ``(zlib.crc32(canonical_id + voice_id), voice_id)``, stable across processes
+      and platforms (unlike Python's salted ``hash()``).
+   f. If even the gender-filtered pool is empty, assign from the full pool
+      and log a warning.
+4. Save the resulting mapping to ``voice_mapping.json`` (versioned).
 
-The assignment is **fully deterministic**: given the same voice pool and
-character list the output is always identical, enabling reproducible tests and
-pipeline resumability.
+The whole-roster assignment (:meth:`~VoiceMapper.assign_all`) is **fully deterministic**
+and roster-order independent: given the same voice pool and character set, the output
+is always identical, enabling reproducible tests and pipeline resumability.
 """
 
 from __future__ import annotations
