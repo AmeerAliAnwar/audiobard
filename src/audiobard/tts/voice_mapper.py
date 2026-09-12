@@ -239,11 +239,23 @@ class VoiceMapper:
         ]
         scored.sort(key=lambda x: (-x[0], x[1]))  # descending similarity, stable by index
 
-        # Step 4: deterministic tie-break among top-scoring voices
-        top_score = scored[0][0]
-        top_voices = [v for score, _, v in scored if abs(score - top_score) < 1e-9]
-        chosen = top_voices[
-            zlib.crc32(character.canonical_id.encode("utf-8")) % len(top_voices)
+        # Step 4: deterministic tie-break prioritizing voice uniqueness across characters
+        assigned_voice_ids = {asmt.voice_id for asmt in self._mapping.values()}
+
+        unused_candidates = [
+            (score, v) for score, _, v in scored if v.id not in assigned_voice_ids
+        ]
+        if unused_candidates:
+            best_unused_score = unused_candidates[0][0]
+            pool_to_pick = [
+                v for score, v in unused_candidates if abs(score - best_unused_score) < 1e-9
+            ]
+        else:
+            top_score = scored[0][0]
+            pool_to_pick = [v for score, _, v in scored if abs(score - top_score) < 1e-9]
+
+        chosen = pool_to_pick[
+            zlib.crc32(character.canonical_id.encode("utf-8")) % len(pool_to_pick)
         ]
 
         return VoiceAssignment(
