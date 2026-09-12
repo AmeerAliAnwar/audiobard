@@ -7,6 +7,7 @@ import io
 import logging
 import re
 import shutil
+import uuid
 from pathlib import Path
 
 import httpx
@@ -115,6 +116,19 @@ class PiperProvider(TTSProvider):
         # 5. Convert WAV to MP3 in worker thread
         return await asyncio.to_thread(_wav_to_mp3, stdout)
 
+    @staticmethod
+    def _is_valid_cache(onnx_path: Path, json_path: Path) -> bool:
+        """Check if both model and metadata files exist with non-zero size."""
+        try:
+            return (
+                onnx_path.is_file()
+                and json_path.is_file()
+                and onnx_path.stat().st_size > 0
+                and json_path.stat().st_size > 0
+            )
+        except OSError:
+            return False
+
     async def _ensure_model(self, voice_id: str) -> Path:
         """Download model and config if they do not exist locally.
 
@@ -125,15 +139,22 @@ class PiperProvider(TTSProvider):
         onnx_path = self.piper_dir / f"{voice_id}.onnx"
         json_path = self.piper_dir / f"{voice_id}.onnx.json"
 
-        # Fast path: already cached (no lock contention on hot path).
-        if onnx_path.exists() and json_path.exists():
+        # Fast path: already cached with valid content.
+        if self._is_valid_cache(onnx_path, json_path):
             return onnx_path
 
         async with self._download_lock:
-            # Re-check after acquiring the lock — another task may have
-            # finished downloading while we waited.
-            if onnx_path.exists() and json_path.exists():
+            # Re-check after acquiring the lock in case another task finished downloading.
+            if self._is_valid_cache(onnx_path, json_path):
                 return onnx_path
+
+            # Clean up corrupted or zero-byte files from prior aborted downloads.
+            for path in (onnx_path, json_path):
+                try:
+                    if path.exists() and path.stat().st_size == 0:
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
             regex = r"^([a-z]{2,3}_[A-Z]{2,3})-([a-zA-Z0-9_]+)-(x_low|low|medium|high)$"
             match = re.match(regex, voice_id)
@@ -154,17 +175,31 @@ class PiperProvider(TTSProvider):
             onnx_url = f"{base_url}.onnx"
             json_url = f"{base_url}.onnx.json"
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                # Download config (json) first
-                logger.info("Downloading Piper config from %s", json_url)
-                res = await client.get(json_url, follow_redirects=True)
-                res.raise_for_status()
-                json_path.write_bytes(res.content)
+            unique_id = uuid.uuid4().hex
+            tmp_json_path = self.piper_dir / f"{voice_id}.{unique_id}.onnx.json.tmp"
+            tmp_onnx_path = self.piper_dir / f"{voice_id}.{unique_id}.onnx.tmp"
 
-                # Download model (onnx)
-                logger.info("Downloading Piper model from %s", onnx_url)
-                res = await client.get(onnx_url, follow_redirects=True)
-                res.raise_for_status()
-                onnx_path.write_bytes(res.content)
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    logger.info("Downloading Piper config from %s", json_url)
+                    res = await client.get(json_url, follow_redirects=True)
+                    res.raise_for_status()
+                    if not res.content:
+                        raise ValueError(f"Received empty response from {json_url}")
+                    tmp_json_path.write_bytes(res.content)
+
+                    logger.info("Downloading Piper model from %s", onnx_url)
+                    res = await client.get(onnx_url, follow_redirects=True)
+                    res.raise_for_status()
+                    if not res.content:
+                        raise ValueError(f"Received empty response from {onnx_url}")
+                    tmp_onnx_path.write_bytes(res.content)
+
+                tmp_json_path.replace(json_path)
+                tmp_onnx_path.replace(onnx_path)
+            finally:
+                tmp_json_path.unlink(missing_ok=True)
+                tmp_onnx_path.unlink(missing_ok=True)
 
             return onnx_path
+
