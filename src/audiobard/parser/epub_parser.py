@@ -76,7 +76,28 @@ class EpubParser(BookParser):
         chapter_idx = 0
         global_index = 0
 
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        items = []
+        spine = getattr(book, "spine", None)
+        if spine:
+            for entry in spine:
+                entry_id = entry[0] if isinstance(entry, (tuple, list)) else entry
+                if hasattr(entry_id, "get_id"):
+                    item = entry_id
+                elif hasattr(book, "get_item_with_id"):
+                    item = book.get_item_with_id(entry_id)
+                else:
+                    item = None
+
+                if not item:
+                    continue
+                if hasattr(item, "get_type") and item.get_type() != ebooklib.ITEM_DOCUMENT:
+                    continue
+                items.append(item)
+
+        if not items:
+            items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+
+        for item in items:
             # Skip known non-body items.
             item_id: str = item.get_id() or ""
             file_name: str = item.get_name() or ""
