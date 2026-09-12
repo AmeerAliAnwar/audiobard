@@ -399,7 +399,10 @@ async def test_audio_processor_concatenate_batch_performance() -> None:
     ]
 
     processor = AudioProcessor()
-    out_bytes = await processor.concatenate(clips)
+    with patch.object(
+        AudioSegment, "append", side_effect=AssertionError("unexpected segment append")
+    ):
+        out_bytes = await processor.concatenate(clips)
     assert len(out_bytes) > 0
 
     segment = AudioSegment.from_file(io.BytesIO(out_bytes), format="mp3")
@@ -438,7 +441,7 @@ async def test_audio_processor_concatenate_mixed_formats() -> None:
 @pytest.mark.asyncio
 async def test_audio_processor_concatenate_zero_pause(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that clips with zero-duration emotion pause do not insert silence frames."""
-    from audiobard.audio.processor import EMOTION_PROSODY
+    from audiobard.tts.base import EMOTION_PROSODY
 
     monkeypatch.setitem(EMOTION_PROSODY, Emotion.WHISPER, {"rate": 0.9, "pause_after_ms": 0})
     dummy_mp3 = _create_custom_mp3(duration_ms=300, frame_rate=24000, channels=1)
