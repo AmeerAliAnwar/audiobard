@@ -231,10 +231,11 @@ class TestParserStats:
 
 
 class _MockEpubItem:
-    def __init__(self, item_id: str, name: str, content: bytes) -> None:
+    def __init__(self, item_id: str, name: str, content: bytes, item_type: int = 9) -> None:
         self._id = item_id
         self._name = name
         self._content = content
+        self._type = item_type
 
     def get_id(self) -> str:
         return self._id
@@ -245,13 +246,27 @@ class _MockEpubItem:
     def get_content(self) -> bytes:
         return self._content
 
+    def get_type(self) -> int:
+        return self._type
+
 
 class _MockEpubBook:
-    def __init__(self, items: list[_MockEpubItem]) -> None:
+    def __init__(
+        self,
+        items: list[_MockEpubItem],
+        spine: list[tuple[str, str]] | None = None,
+    ) -> None:
         self._items = items
+        self.spine = spine if spine is not None else [(item.get_id(), "yes") for item in items]
 
     def get_items_of_type(self, item_type: int) -> list[_MockEpubItem]:
-        return self._items
+        return [item for item in self._items if item.get_type() == item_type]
+
+    def get_item_with_id(self, item_id: str) -> _MockEpubItem | None:
+        for item in self._items:
+            if item.get_id() == item_id:
+                return item
+        return None
 
 
 class TestEpubParser:
@@ -314,6 +329,78 @@ class TestEpubParser:
         )
         res = _html_to_text(raw).strip()
         assert res == "'Hello' © 2026 \u2019test\u2019 \u2019hex\u2019 ® € £ ¢ § … •"
+
+    def test_epub_parser_spine_order_different_from_manifest(self) -> None:
+        from unittest.mock import patch
+
+        from audiobard.parser.epub_parser import EpubParser
+
+        # Manifest order is ch2 then ch1, but spine order specifies ch1 then ch2.
+        items = [
+            _MockEpubItem("ch2", "ch2.xhtml", b"<p>Second chapter content.</p>"),
+            _MockEpubItem("ch1", "ch1.xhtml", b"<p>First chapter content.</p>"),
+        ]
+        mock_book = _MockEpubBook(items, spine=[("ch1", "yes"), ("ch2", "yes")])
+
+        with patch("ebooklib.epub.read_epub", return_value=mock_book):
+            parser = EpubParser()
+            paragraphs = parser.parse(b"dummy-epub-bytes")
+            assert len(paragraphs) == 2
+            assert paragraphs[0].text == "First chapter content."
+            assert paragraphs[0].chapter == 0
+            assert paragraphs[1].text == "Second chapter content."
+            assert paragraphs[1].chapter == 1
+
+    def test_epub_parser_fallback_when_spine_is_empty(self) -> None:
+        from unittest.mock import patch
+
+        from audiobard.parser.epub_parser import EpubParser
+
+        items = [
+            _MockEpubItem("ch1", "ch1.xhtml", b"<p>Fallback paragraph.</p>"),
+        ]
+        mock_book = _MockEpubBook(items, spine=[])
+
+        with patch("ebooklib.epub.read_epub", return_value=mock_book):
+            parser = EpubParser()
+            paragraphs = parser.parse(b"dummy-epub-bytes")
+            assert len(paragraphs) == 1
+            assert paragraphs[0].text == "Fallback paragraph."
+
+    def test_epub_parser_ignores_non_document_spine_items(self) -> None:
+        from unittest.mock import patch
+
+        from audiobard.parser.epub_parser import EpubParser
+
+        items = [
+            _MockEpubItem("img1", "img1.png", b"image-data", item_type=1),
+            _MockEpubItem("ch1", "ch1.xhtml", b"<p>Only document content.</p>", item_type=9),
+        ]
+        mock_book = _MockEpubBook(items, spine=[("img1", "yes"), ("ch1", "yes")])
+
+        with patch("ebooklib.epub.read_epub", return_value=mock_book):
+            parser = EpubParser()
+            paragraphs = parser.parse(b"dummy-epub-bytes")
+            assert len(paragraphs) == 1
+            assert paragraphs[0].text == "Only document content."
+
+    def test_epub_parser_non_empty_spine_does_not_leak_excluded_manifest_docs(self) -> None:
+        from unittest.mock import patch
+
+        from audiobard.parser.epub_parser import EpubParser
+
+        # Manifest contains an unlisted doc, while spine only references a non-document.
+        items = [
+            _MockEpubItem("img1", "cover.png", b"image-data", item_type=1),
+            _MockEpubItem("aux", "auxiliary.xhtml", b"<p>Auxiliary text.</p>", item_type=9),
+        ]
+        mock_book = _MockEpubBook(items, spine=[("img1", "yes")])
+
+        with patch("ebooklib.epub.read_epub", return_value=mock_book):
+            parser = EpubParser()
+            paragraphs = parser.parse(b"dummy-epub-bytes")
+            assert len(paragraphs) == 0
+
 
 
 class TestEpubStyleScriptStripping:
