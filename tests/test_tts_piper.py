@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import respx
+import httpx
 from httpx import Response
 
 from audiobard.config import AudioBardConfig
@@ -272,4 +273,87 @@ async def test_piper_ensure_model_concurrent_downloads_once(tmp_path: Path) -> N
     # Without the lock, each concurrent caller would hit the network.
     assert onnx_route.call_count == 1
     assert json_route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_piper_ensure_model_atomic_failure_cleanup(tmp_path: Path) -> None:
+    """If model download fails midway, no partial tmp or target files should remain."""
+    config = AudioBardConfig(cache_dir=tmp_path, db_path=tmp_path / "test.db")
+    provider = PiperProvider(config)
+
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+        "en/en_US/dummy/medium/en_US-dummy-medium"
+    )
+    respx.get(f"{base_url}.onnx.json").mock(
+        return_value=Response(200, content=b'{"config": true}')
+    )
+    respx.get(f"{base_url}.onnx").mock(
+        return_value=Response(500, content=b"server error")
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await provider._ensure_model("en_US-dummy-medium")
+
+    piper_dir = tmp_path / "piper"
+    assert not (piper_dir / "en_US-dummy-medium.onnx").exists()
+    assert not (piper_dir / "en_US-dummy-medium.onnx.json").exists()
+    assert not (piper_dir / "en_US-dummy-medium.onnx.tmp").exists()
+    assert not (piper_dir / "en_US-dummy-medium.onnx.json.tmp").exists()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_piper_ensure_model_cleans_corrupt_zero_byte_cache(tmp_path: Path) -> None:
+    """Zero-byte files in cache must be recognized as corrupted, deleted, and re-downloaded."""
+    config = AudioBardConfig(cache_dir=tmp_path, db_path=tmp_path / "test.db")
+    piper_dir = tmp_path / "piper"
+    piper_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed 0-byte corrupted cache files
+    corrupt_onnx = piper_dir / "en_US-dummy-medium.onnx"
+    corrupt_json = piper_dir / "en_US-dummy-medium.onnx.json"
+    corrupt_onnx.write_bytes(b"")
+    corrupt_json.write_bytes(b"")
+
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+        "en/en_US/dummy/medium/en_US-dummy-medium"
+    )
+    respx.get(f"{base_url}.onnx").mock(
+        return_value=Response(200, content=b"valid-onnx-bytes")
+    )
+    respx.get(f"{base_url}.onnx.json").mock(
+        return_value=Response(200, content=b'{"config": true}')
+    )
+
+    provider = PiperProvider(config)
+    result = await provider._ensure_model("en_US-dummy-medium")
+
+    assert result == corrupt_onnx
+    assert corrupt_onnx.read_bytes() == b"valid-onnx-bytes"
+    assert corrupt_json.read_bytes() == b'{"config": true}'
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_piper_ensure_model_rejects_empty_download(tmp_path: Path) -> None:
+    """Empty response body from remote must raise ValueError and not commit to cache."""
+    config = AudioBardConfig(cache_dir=tmp_path, db_path=tmp_path / "test.db")
+    provider = PiperProvider(config)
+
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+        "en/en_US/dummy/medium/en_US-dummy-medium"
+    )
+    respx.get(f"{base_url}.onnx.json").mock(
+        return_value=Response(200, content=b"")
+    )
+
+    with pytest.raises(ValueError, match="Received empty response"):
+        await provider._ensure_model("en_US-dummy-medium")
+
+    piper_dir = tmp_path / "piper"
+    assert not (piper_dir / "en_US-dummy-medium.onnx.json").exists()
 
