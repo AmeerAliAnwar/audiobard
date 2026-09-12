@@ -117,6 +117,24 @@ def _get_book_by_id(book_id: int) -> dict[str, Any] | None:
     return None
 
 
+def _get_output_dir(custom_path: str | Path | None = None) -> Path:
+    """Return the output directory, prioritizing a configured custom path."""
+    if custom_path:
+        custom_str = str(custom_path).strip()
+        if custom_str:
+            return Path(custom_str).expanduser().resolve()
+    return Path.home() / "AudioBard" / "output"
+
+
+def _find_audio_file(stem: str, custom_output: str | Path | None = None) -> Path:
+    """Locate an audiobook file, checking custom output dir before default."""
+    if custom_output:
+        custom_file = _get_output_dir(custom_output) / f"{stem}.mp3"
+        if custom_file.exists():
+            return custom_file
+    return _get_output_dir() / f"{stem}.mp3"
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check — Tauri queries this on startup."""
@@ -144,6 +162,7 @@ async def get_progress(session_id: str | None = None) -> dict[str, Any]:
         "message": progress.message,
     }
 
+
 @app.post("/cancel")
 async def cancel_generation(request: dict[str, Any]) -> dict[str, str]:
     """Mark a generation session as cancelled.
@@ -166,14 +185,13 @@ async def cancel_generation(request: dict[str, Any]) -> dict[str, str]:
 
 
 @app.get("/library")
-async def get_library() -> list[dict[str, Any]]:
+async def get_library(output_folder: str | None = None) -> list[dict[str, Any]]:
     """Return all generated books with metadata."""
     books = _get_all_books()
-    output_dir = Path.home() / "AudioBard" / "output"
     result = []
     for book in books:
         stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
-        audio_file = output_dir / f"{stem}.mp3"
+        audio_file = _find_audio_file(stem, output_folder)
         has_audio = audio_file.exists() and audio_file.stat().st_size > 1024
         result.append(
             {
@@ -208,14 +226,12 @@ async def get_book(book_id: int) -> dict[str, Any]:
 
 
 @app.get("/book/{book_id}/download")
-async def download_book(book_id: int) -> FileResponse:
+async def download_book(book_id: int, output_folder: str | None = None) -> FileResponse:
     """Download the generated audiobook file."""
     book = _get_book_by_id(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    # Reconstruct output path (same logic as generate_audiobook)
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_path = _find_audio_file(Path(book["path"]).stem, output_folder)
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
     return FileResponse(
@@ -226,35 +242,37 @@ async def download_book(book_id: int) -> FileResponse:
 
 
 @app.get("/book/{book_id}/path")
-async def get_book_path(book_id: int) -> dict[str, str]:
+async def get_book_path(book_id: int, output_folder: str | None = None) -> dict[str, str]:
     """Return the local filesystem path of the generated audio file."""
     book = _get_book_by_id(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_path = _find_audio_file(Path(book["path"]).stem, output_folder)
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found on disk")
     return {"path": str(output_path)}
 
 
 @app.delete("/book/{book_id}")
-async def delete_book(book_id: int) -> dict[str, str]:
+async def delete_book(book_id: int, output_folder: str | None = None) -> dict[str, str]:
     """Delete a book from the library and remove any generated audio files."""
     book = _get_book_by_id(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_path = _find_audio_file(Path(book["path"]).stem, output_folder)
     if output_path.exists():
         with contextlib.suppress(OSError):
             output_path.unlink()
 
+    default_output = _get_output_dir() / f"{Path(book['path']).stem}.mp3"
+    if default_output.exists() and default_output != output_path:
+        with contextlib.suppress(OSError):
+            default_output.unlink()
+
     manager = _get_persistence()
     manager.delete_book(book_id)
     return {"status": "deleted"}
-
 
 
 @app.post("/book/{book_id}/regenerate")
@@ -277,7 +295,7 @@ async def regenerate_book(book_id: int, request: dict[str, Any]) -> dict[str, st
     tts_provider = cast(TTSChoice, str(request.get("tts_provider", "piper")))
     locale = str(request.get("locale", "en_US"))
 
-    output_dir = Path.home() / "AudioBard" / "output"
+    output_dir = _get_output_dir(request.get("output_folder"))
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{source_path.stem}.mp3"
 
@@ -299,9 +317,7 @@ async def regenerate_book(book_id: int, request: dict[str, Any]) -> dict[str, st
                 raise asyncio.CancelledError()
 
         pipeline = AudioBookPipeline(config)
-        await pipeline.run(
-            source_path, output_path, resume=False, progress_callback=on_progress
-        )
+        await pipeline.run(source_path, output_path, resume=False, progress_callback=on_progress)
 
     asyncio.create_task(_run())
     return {"session_id": session_id, "status": "started"}
@@ -399,7 +415,7 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
                     detail="Audiobook generation failed - output file not found",
                 )
 
-            permanent_dir = Path.home() / "AudioBard" / "output"
+            permanent_dir = _get_output_dir(request.get("output_folder"))
             permanent_dir.mkdir(parents=True, exist_ok=True)
             permanent_path = permanent_dir / output_path.name
             # shutil.copy2 in this thread pool keeps the sidecar responsive.
