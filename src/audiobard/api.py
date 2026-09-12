@@ -152,6 +152,24 @@ def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> 
     return input_path
 
 
+def _delete_book_source(source_path: Path) -> None:
+    """Remove stored book file if inside books_dir."""
+    books_dir = _get_books_dir().resolve()
+    resolved = source_path.resolve()
+    with contextlib.suppress(ValueError, OSError):
+        if resolved.is_relative_to(books_dir) and resolved.is_file():
+            resolved.unlink(missing_ok=True)
+
+
+def _update_book_title(path: Path, title: str) -> None:
+    """Update book title in persistence for the given path."""
+    persistence = _get_persistence()
+    path_str = str(path.resolve())
+    with persistence._get_conn() as conn:
+        conn.execute("UPDATE books SET title = ? WHERE path = ?", (title, path_str))
+        conn.commit()
+
+
 def _is_book_registered(path: Path) -> bool:
     """Check if a book record exists in persistence for the given path."""
     persistence = _get_persistence()
@@ -172,12 +190,8 @@ def _cleanup_book_files(book: dict[str, Any]) -> None:
         with contextlib.suppress(OSError):
             output_path.unlink()
 
-    books_dir = _get_books_dir()
     if book.get("path"):
-        source_path = Path(book["path"]).resolve()
-        with contextlib.suppress(ValueError, OSError):
-            if source_path.is_relative_to(books_dir.resolve()) and source_path.is_file():
-                source_path.unlink()
+        _delete_book_source(Path(book["path"]))
 
 
 @app.get("/health")
@@ -403,7 +417,8 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
         file_bytes = base64.b64decode(raw_b64)
 
         clean_name = Path(file_name).name.strip()
-        raw_stem = Path(clean_name).stem if clean_name else "book"
+        raw_stem = Path(clean_name).stem.strip() or "book"
+        display_title = raw_stem
         safe_stem = (
             "".join(c for c in raw_stem if c.isalnum() or c in ("-", "_")).strip("._")
             or "book"
@@ -457,7 +472,6 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
 
                 try:
                     await pipeline.run(input_path, output_path, progress_callback=on_progress)
-                    book_registered = True
                 except asyncio.CancelledError:
                     progress_store.update(
                         session_id,
@@ -482,13 +496,14 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
                 permanent_path = permanent_dir / output_path.name
                 # shutil.copy2 in this thread pool keeps the sidecar responsive.
                 await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
+                book_registered = True
+                await asyncio.to_thread(_update_book_title, input_path, display_title)
                 return {"session_id": session_id, "output_path": str(permanent_path)}
         finally:
             if not book_registered:
                 is_reg = await asyncio.to_thread(_is_book_registered, input_path)
                 if not is_reg:
-                    with contextlib.suppress(OSError):
-                        await asyncio.to_thread(input_path.unlink, missing_ok=True)
+                    await asyncio.to_thread(_delete_book_source, input_path)
 
     except HTTPException:
         raise

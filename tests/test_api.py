@@ -26,6 +26,8 @@ def _isolate_audiobard_home(
 ) -> None:
     fake_home = tmp_path_factory.mktemp("audiobard_test_home")
     monkeypatch.setattr(Path, "home", lambda: fake_home)
+    test_db = fake_home / "test_audiobard.db"
+    monkeypatch.setenv("AUDIOBARD_DB_PATH", str(test_db))
 
 
 @pytest.fixture
@@ -652,6 +654,7 @@ def test_generate_audiobook_unique_filenames_no_collision(
     books_dir = tmp_path / "AudioBard" / "books"
     persisted = list(books_dir.glob("book_*.txt"))
     assert len(persisted) == 2
+    assert persisted[0] != persisted[1]
 
 
 def test_generate_audiobook_sanitizes_path_traversal(
@@ -673,9 +676,46 @@ def test_generate_audiobook_sanitizes_path_traversal(
 
     assert response.status_code == 200
     books_dir = tmp_path / "AudioBard" / "books"
-    persisted = list(books_dir.iterdir())
+    persisted = list(books_dir.glob("evil_*.txt"))
     assert len(persisted) == 1
     assert persisted[0].parent.resolve() == books_dir.resolve()
+
+
+def test_generate_audiobook_preserves_display_title(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Original book stem with punctuation and spaces is preserved in persistence."""
+    from audiobard.api import _get_persistence
+    from audiobard.parser.base import ParserStats
+
+    async def _stub_with_db(input_path: Path, output_path: Path, **_kwargs: Any) -> None:
+        _stub_pipeline_run(input_path, output_path)
+        persistence = _get_persistence()
+        persistence.get_or_create_book(
+            input_path,
+            "temporary_title",
+            ParserStats(total_paragraphs=5, total_words=50, dialog_ratio=0.2),
+        )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_with_db)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        payload = _generate_payload("session-title")
+        payload["file_name"] = "Alice's Adventures in Wonderland.txt"
+        response = client.post("/generate", json=payload)
+
+    assert response.status_code == 200
+    r = client.get("/library")
+    assert r.status_code == 200
+    books = r.json()
+    assert len(books) == 1
+    assert books[0]["title"] == "Alice's Adventures in Wonderland"
+
 
 
 
