@@ -276,9 +276,15 @@ class VoiceMapper:
             top_score = scored[0][0]
             pool_to_pick = [v for score, _, v in scored if abs(score - top_score) < 1e-9]
 
-        chosen = pool_to_pick[
-            zlib.crc32(character.canonical_id.encode("utf-8")) % len(pool_to_pick)
-        ]
+        chosen = min(
+            pool_to_pick,
+            key=lambda v: (
+                zlib.crc32(
+                    character.canonical_id.encode("utf-8") + v.id.encode("utf-8")
+                ),
+                v.id,
+            ),
+        )
 
         return VoiceAssignment(
             canonical_id=character.canonical_id,
