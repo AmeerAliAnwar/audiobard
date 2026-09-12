@@ -384,6 +384,24 @@ class TestEpubParser:
             assert len(paragraphs) == 1
             assert paragraphs[0].text == "Only document content."
 
+    def test_epub_parser_non_empty_spine_does_not_leak_excluded_manifest_docs(self) -> None:
+        from unittest.mock import patch
+
+        from audiobard.parser.epub_parser import EpubParser
+
+        # Manifest contains an unlisted doc, while spine only references a non-document.
+        items = [
+            _MockEpubItem("img1", "cover.png", b"image-data", item_type=1),
+            _MockEpubItem("aux", "auxiliary.xhtml", b"<p>Auxiliary text.</p>", item_type=9),
+        ]
+        mock_book = _MockEpubBook(items, spine=[("img1", "yes")])
+
+        with patch("ebooklib.epub.read_epub", return_value=mock_book):
+            parser = EpubParser()
+            paragraphs = parser.parse(b"dummy-epub-bytes")
+            assert len(paragraphs) == 0
+
+
 
 class TestEpubStyleScriptStripping:
     def test_style_block_contents_are_not_narrated(self) -> None:

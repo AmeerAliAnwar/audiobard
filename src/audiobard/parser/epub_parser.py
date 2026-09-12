@@ -93,8 +93,7 @@ class EpubParser(BookParser):
                 if hasattr(item, "get_type") and item.get_type() != ebooklib.ITEM_DOCUMENT:
                     continue
                 items.append(item)
-
-        if not items:
+        else:
             items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
 
         for item in items:
