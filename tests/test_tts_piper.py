@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 import respx
-import httpx
 from httpx import Response
 
 from audiobard.config import AudioBardConfig
@@ -299,8 +299,7 @@ async def test_piper_ensure_model_atomic_failure_cleanup(tmp_path: Path) -> None
     piper_dir = tmp_path / "piper"
     assert not (piper_dir / "en_US-dummy-medium.onnx").exists()
     assert not (piper_dir / "en_US-dummy-medium.onnx.json").exists()
-    assert not (piper_dir / "en_US-dummy-medium.onnx.tmp").exists()
-    assert not (piper_dir / "en_US-dummy-medium.onnx.json.tmp").exists()
+    assert not list(piper_dir.glob("*.tmp"))
 
 
 @pytest.mark.asyncio
@@ -356,4 +355,35 @@ async def test_piper_ensure_model_rejects_empty_download(tmp_path: Path) -> None
 
     piper_dir = tmp_path / "piper"
     assert not (piper_dir / "en_US-dummy-medium.onnx.json").exists()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_piper_ensure_model_concurrent_separate_instances(tmp_path: Path) -> None:
+    """Distinct PiperProvider instances downloading concurrently must not collide on temp files."""
+    config = AudioBardConfig(cache_dir=tmp_path, db_path=tmp_path / "test.db")
+    provider1 = PiperProvider(config)
+    provider2 = PiperProvider(config)
+
+    base_url = (
+        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+        "en/en_US/dummy/medium/en_US-dummy-medium"
+    )
+    respx.get(f"{base_url}.onnx").mock(
+        return_value=Response(200, content=b"concurrent-onnx-bytes")
+    )
+    respx.get(f"{base_url}.onnx.json").mock(
+        return_value=Response(200, content=b'{"config": true}')
+    )
+
+    p1_res, p2_res = await asyncio.gather(
+        provider1._ensure_model("en_US-dummy-medium"),
+        provider2._ensure_model("en_US-dummy-medium"),
+    )
+
+    piper_dir = tmp_path / "piper"
+    assert p1_res == piper_dir / "en_US-dummy-medium.onnx"
+    assert p2_res == piper_dir / "en_US-dummy-medium.onnx"
+    assert p1_res.read_bytes() == b"concurrent-onnx-bytes"
+    assert not list(piper_dir.glob("*.tmp"))
 

@@ -7,6 +7,7 @@ import io
 import logging
 import re
 import shutil
+import uuid
 from pathlib import Path
 
 import httpx
@@ -174,8 +175,9 @@ class PiperProvider(TTSProvider):
             onnx_url = f"{base_url}.onnx"
             json_url = f"{base_url}.onnx.json"
 
-            tmp_json_path = self.piper_dir / f"{voice_id}.onnx.json.tmp"
-            tmp_onnx_path = self.piper_dir / f"{voice_id}.onnx.tmp"
+            unique_id = uuid.uuid4().hex
+            tmp_json_path = self.piper_dir / f"{voice_id}.{unique_id}.onnx.json.tmp"
+            tmp_onnx_path = self.piper_dir / f"{voice_id}.{unique_id}.onnx.tmp"
 
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
