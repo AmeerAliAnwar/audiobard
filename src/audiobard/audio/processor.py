@@ -142,16 +142,34 @@ class AudioProcessor:
         if not clips:
             return b""
 
-        combined = AudioSegment.empty()
+        segments: list[AudioSegment] = []
         for clip in clips:
             segment = AudioSegment.from_file(io.BytesIO(clip.mp3_bytes), format="mp3")
-            combined += segment
+            segments.append(segment)
 
             # Add silence gap after the clip based on its emotion
             pause_ms = EMOTION_PROSODY.get(clip.emotion, {"pause_after_ms": 250})[
                 "pause_after_ms"
             ]
-            combined += AudioSegment.silent(duration=pause_ms)
+            if pause_ms > 0:
+                silence = AudioSegment.silent(
+                    duration=pause_ms,
+                    frame_rate=segment.frame_rate,
+                )
+                if segment.channels != 1:
+                    silence = silence.set_channels(segment.channels)
+                if segment.sample_width != silence.sample_width:
+                    silence = silence.set_sample_width(segment.sample_width)
+                segments.append(silence)
+
+        if not segments:
+            return b""
+
+        # Linear O(N) concatenation: synchronize audio properties across segments once,
+        # then join underlying PCM byte buffers in a single pass to avoid O(N^2) reallocation.
+        synced = AudioSegment._sync(*segments)
+        raw_data = b"".join(s.raw_data for s in synced)
+        combined = synced[0]._spawn(raw_data)
 
         # Normalize volume to -16 dBFS (approx -16 LUFS for speech)
         if combined.dBFS != float("-inf"):
