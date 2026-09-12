@@ -152,6 +152,17 @@ def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> 
     return input_path
 
 
+def _is_book_registered(path: Path) -> bool:
+    """Check if a book record exists in persistence for the given path."""
+    persistence = _get_persistence()
+    path_str = str(path.resolve())
+    with persistence._get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM books WHERE path = ?", (path_str,)
+        ).fetchone()
+        return row is not None
+
+
 def _cleanup_book_files(book: dict[str, Any]) -> None:
     """Remove generated audio file and stored uploaded book if present."""
     output_dir = _get_output_dir()
@@ -392,71 +403,92 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
         file_bytes = base64.b64decode(raw_b64)
 
         clean_name = Path(file_name).name.strip()
-        if not clean_name or clean_name in {".", ".."}:
-            clean_name = f"book_{session_id}.txt"
+        raw_stem = Path(clean_name).stem if clean_name else "book"
+        safe_stem = (
+            "".join(c for c in raw_stem if c.isalnum() or c in ("-", "_")).strip("._")
+            or "book"
+        )
+        raw_suffix = Path(clean_name).suffix if clean_name else ".txt"
+        safe_suffix = "".join(c for c in raw_suffix if c.isalnum() or c == ".").strip() or ".txt"
+        if not safe_suffix.startswith("."):
+            safe_suffix = f".{safe_suffix}"
+
+        unique_upload_id = uuid.uuid4().hex[:8]
+        unique_filename = f"{safe_stem}_{unique_upload_id}{safe_suffix}"
 
         books_dir = _get_books_dir()
-        input_path = await asyncio.to_thread(_save_uploaded_book, books_dir, clean_name, file_bytes)
+        input_path = await asyncio.to_thread(
+            _save_uploaded_book, books_dir, unique_filename, file_bytes
+        )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            output_dir = tmp_path / "output"
-            output_dir.mkdir()
+        book_registered = False
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                output_dir = tmp_path / "output"
+                output_dir.mkdir()
 
-            config = AudioBardConfig(
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                llm_base_url=str(request.get("llm_base_url") or "http://localhost:11434"),
-                openrouter_api_key=str(request.get("openrouter_api_key") or ""),
-                gemini_api_key=str(request.get("gemini_api_key") or ""),
-                nim_api_key=str(request.get("nim_api_key") or ""),
-                tts_provider=tts_provider,
-                tts_locale=locale,
-            )
-            pipeline = AudioBookPipeline(config)
+                config = AudioBardConfig(
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    llm_base_url=str(request.get("llm_base_url") or "http://localhost:11434"),
+                    openrouter_api_key=str(request.get("openrouter_api_key") or ""),
+                    gemini_api_key=str(request.get("gemini_api_key") or ""),
+                    nim_api_key=str(request.get("nim_api_key") or ""),
+                    tts_provider=tts_provider,
+                    tts_locale=locale,
+                )
+                pipeline = AudioBookPipeline(config)
 
-            output_path = output_dir / f"{input_path.stem}.mp3"
+                output_path = output_dir / f"{input_path.stem}.mp3"
 
-            # Mark the session as running before we await the pipeline so
-            # the first poll (which may already be in flight on the Tauri
-            # side) sees a non-zero state instead of an idle placeholder.
-            progress_store.update(
-                session_id,
-                PipelineProgress(stage="queued", percent=0, message="Starting"),
-            )
-
-            def on_progress(progress: PipelineProgress) -> None:
-                progress_store.update(session_id, progress)
-                if progress_store.is_cancelled(session_id):
-                    raise asyncio.CancelledError()
-
-            try:
-                await pipeline.run(input_path, output_path, progress_callback=on_progress)
-            except asyncio.CancelledError:
+                # Mark the session as running before we await the pipeline so
+                # the first poll (which may already be in flight on the Tauri
+                # side) sees a non-zero state instead of an idle placeholder.
                 progress_store.update(
                     session_id,
-                    PipelineProgress(
-                        stage="cancelled",
-                        percent=0,
-                        message="Cancelled by user",
-                    ),
-                )
-                raise HTTPException(
-                    status_code=499,
-                    detail="Generation cancelled by user",
-                ) from None
-
-            if not output_path.exists():
-                raise HTTPException(
-                    status_code=500,
-                    detail="Audiobook generation failed - output file not found",
+                    PipelineProgress(stage="queued", percent=0, message="Starting"),
                 )
 
-            permanent_dir = _get_output_dir()
-            permanent_path = permanent_dir / output_path.name
-            # shutil.copy2 in this thread pool keeps the sidecar responsive.
-            await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
-            return {"session_id": session_id, "output_path": str(permanent_path)}
+                def on_progress(progress: PipelineProgress) -> None:
+                    progress_store.update(session_id, progress)
+                    if progress_store.is_cancelled(session_id):
+                        raise asyncio.CancelledError()
+
+                try:
+                    await pipeline.run(input_path, output_path, progress_callback=on_progress)
+                    book_registered = True
+                except asyncio.CancelledError:
+                    progress_store.update(
+                        session_id,
+                        PipelineProgress(
+                            stage="cancelled",
+                            percent=0,
+                            message="Cancelled by user",
+                        ),
+                    )
+                    raise HTTPException(
+                        status_code=499,
+                        detail="Generation cancelled by user",
+                    ) from None
+
+                if not output_path.exists():
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Audiobook generation failed - output file not found",
+                    )
+
+                permanent_dir = _get_output_dir()
+                permanent_path = permanent_dir / output_path.name
+                # shutil.copy2 in this thread pool keeps the sidecar responsive.
+                await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
+                return {"session_id": session_id, "output_path": str(permanent_path)}
+        finally:
+            if not book_registered:
+                is_reg = await asyncio.to_thread(_is_book_registered, input_path)
+                if not is_reg:
+                    with contextlib.suppress(OSError):
+                        await asyncio.to_thread(input_path.unlink, missing_ok=True)
 
     except HTTPException:
         raise

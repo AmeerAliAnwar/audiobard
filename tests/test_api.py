@@ -20,6 +20,14 @@ def _clear_progress_store() -> None:
     progress_store.clear_state_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_audiobard_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_home = tmp_path_factory.mktemp("audiobard_test_home")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
@@ -117,7 +125,8 @@ def test_generate_audiobook_success(client: TestClient, tmp_path: Path) -> None:
     body = response.json()
     assert body["session_id"] == "session-A"
     assert "output_path" in body
-    assert Path(body["output_path"]).name == "book.mp3"
+    assert Path(body["output_path"]).name.startswith("book_")
+    assert Path(body["output_path"]).suffix == ".mp3"
     # Pipeline should have been invoked with a progress callback that
     # updates the store for the same session.
     fake_pipeline.run.assert_awaited_once()
@@ -494,9 +503,11 @@ def test_generate_audiobook_persists_uploaded_file(
 
     assert response.status_code == 200, response.text
     books_dir = tmp_path / "AudioBard" / "books"
-    persisted_file = books_dir / "book.txt"
-    assert persisted_file.exists()
-    assert persisted_file.read_bytes() == b"book-content"
+    persisted = list(books_dir.glob("book_*.txt"))
+    assert len(persisted) == 1
+    assert persisted[0].read_bytes() == b"book-content"
+    body = response.json()
+    assert Path(body["output_path"]).stem == persisted[0].stem
 
 
 def test_regenerate_book_succeeds_for_uploaded_book(
@@ -596,5 +607,75 @@ def test_delete_book_preserves_external_source_file(
     assert r.status_code == 200
     assert not audio_file.exists()
     assert external_source.exists()
+
+
+def test_generate_audiobook_unregistered_failure_cleans_up_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """When pipeline raises before registering the book, orphan upload file is removed."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=ValueError("corrupt book content"))
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        response = client.post("/generate", json=_generate_payload("session-fail-cleanup"))
+
+    assert response.status_code == 500
+    books_dir = tmp_path / "AudioBard" / "books"
+    if books_dir.exists():
+        assert list(books_dir.glob("book_*.txt")) == []
+
+
+def test_generate_audiobook_unique_filenames_no_collision(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Repeated uploads of the same filename produce distinct source files and output paths."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r1 = client.post("/generate", json=_generate_payload("session-1"))
+        r2 = client.post("/generate", json=_generate_payload("session-2"))
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    p1 = r1.json()["output_path"]
+    p2 = r2.json()["output_path"]
+    assert p1 != p2
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted = list(books_dir.glob("book_*.txt"))
+    assert len(persisted) == 2
+
+
+def test_generate_audiobook_sanitizes_path_traversal(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Path traversal in filename and session_id is safely contained within books_dir."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        payload = _generate_payload()
+        payload["file_name"] = "../../evil.txt"
+        payload["session_id"] = "../../escape_id"
+        response = client.post("/generate", json=payload)
+
+    assert response.status_code == 200
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted = list(books_dir.iterdir())
+    assert len(persisted) == 1
+    assert persisted[0].parent.resolve() == books_dir.resolve()
+
 
 
