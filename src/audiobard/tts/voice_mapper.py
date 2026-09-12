@@ -138,8 +138,9 @@ class VoiceMapper:
     def assign(self, character: Character) -> VoiceAssignment:
         """Return (and cache) a :class:`VoiceAssignment` for *character*.
 
-        The result is deterministic: the same character always maps to the
-        same voice given the same pool.
+        Assignments prioritize voice uniqueness against previously assigned
+        characters in this mapper. For whole-roster allocation that canonicalizes
+        assignment order and prioritizes constrained pools, use :meth:`assign_all`.
         """
         if character.canonical_id in self._mapping:
             return self._mapping[character.canonical_id]
@@ -149,8 +150,17 @@ class VoiceMapper:
         return assignment
 
     def assign_all(self, characters: list[Character]) -> dict[str, VoiceAssignment]:
-        """Assign voices to a list of characters, returning the full mapping."""
-        for char in characters:
+        """Assign voices to a list of characters, returning the full mapping.
+
+        Sorts unmapped characters to allocate constrained candidate pools first
+        and canonicalizes by ID for strict determinism independent of input order.
+        """
+        unmapped = [c for c in characters if c.canonical_id not in self._mapping]
+        sorted_chars = sorted(
+            unmapped,
+            key=lambda c: (len(self._candidate_pool_for(c)), c.canonical_id),
+        )
+        for char in sorted_chars:
             self.assign(char)
         return dict(self._mapping)
 
@@ -200,8 +210,8 @@ class VoiceMapper:
             raise ValueError(f"Voice pool is empty: {self.voices_path}")
         logger.debug("Loaded %d voices from %s", len(self._pool), self.voices_path)
 
-    def _compute_assignment(self, character: Character) -> VoiceAssignment:
-        # Step 1: filter by gender_hint (mandatory when available)
+    def _candidate_pool_for(self, character: Character) -> list[Voice]:
+        """Return candidate voices for *character* filtered by gender and age hints."""
         effective_gender = character.gender_hint
         if effective_gender == GenderHint.NEUTRAL:
             # Whole-word clues only — substring "man"/"he" mis-gendered Amanda/Michelle (#79).
@@ -221,15 +231,17 @@ class VoiceMapper:
                 )
             gender_pool = list(self._pool)
 
-        # Step 2: filter by age_hint (best-effort)
         age_pool = [v for v in gender_pool if v.age == character.age_hint]
-        candidate_pool = age_pool if age_pool else gender_pool
         if not age_pool:
             logger.debug(
                 "No voices matching age_hint=%s for %s; falling back to gender pool.",
                 character.age_hint,
                 character.canonical_id,
             )
+        return age_pool if age_pool else gender_pool
+
+    def _compute_assignment(self, character: Character) -> VoiceAssignment:
+        candidate_pool = self._candidate_pool_for(character)
 
         # Step 3: score by cosine similarity to tone vector
         tone_vec = _TONE_VECTORS.get(character.tone.value, _TONE_VECTORS[Tone.NEUTRAL.value])

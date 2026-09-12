@@ -451,24 +451,25 @@ def test_assign_falls_back_to_voice_reuse_when_pool_exhausted(tmp_path: Path) ->
 def test_assign_prefers_unused_voices_across_different_tones(tmp_path: Path) -> None:
     """Unused voices in candidate pool are preferred before repeating assigned voices."""
     pool = [
-        {"id": "v_warm", "locale": "en_US", "gender": "female", "age": "adult", "energy": 0.8},
-        {"id": "v_calm", "locale": "en_US", "gender": "female", "age": "adult", "energy": 0.3},
+        {"id": "v_high", "locale": "en_US", "gender": "female", "age": "adult", "energy": 0.9},
+        {"id": "v_low", "locale": "en_US", "gender": "female", "age": "adult", "energy": 0.2},
     ]
     p = tmp_path / "en_US.json"
     p.write_text(json.dumps(pool), encoding="utf-8")
     mapper = VoiceMapper(voices_path=p)
 
     c1 = Character(
-        canonical_id="Character_A", name="Alice", gender_hint=GenderHint.FEMALE, tone=Tone.WARM
+        canonical_id="Character_A", name="Alice", gender_hint=GenderHint.FEMALE, tone=Tone.AGITATED
     )
     c2 = Character(
-        canonical_id="Character_B", name="Betty", gender_hint=GenderHint.FEMALE, tone=Tone.WARM
+        canonical_id="Character_B", name="Betty", gender_hint=GenderHint.FEMALE, tone=Tone.AGITATED
     )
 
     a1 = mapper.assign(c1)
     a2 = mapper.assign(c2)
     assert a1.voice_id != a2.voice_id
-    assert {a1.voice_id, a2.voice_id} == {"v_warm", "v_calm"}
+    assert a1.voice_id == "v_high"
+    assert a2.voice_id == "v_low"
 
 
 def test_resumption_preserves_uniqueness_with_preloaded_mapping(tmp_path: Path) -> None:
@@ -502,5 +503,55 @@ def test_resumption_preserves_uniqueness_with_preloaded_mapping(tmp_path: Path) 
     )
     a2 = mapper.assign(c2)
     assert a2.voice_id == "v1"
+
+
+def test_assign_all_allocates_constrained_pools_first(tmp_path: Path) -> None:
+    """Constrained age pools are assigned before broad gender fallback pools."""
+    pool = [
+        {"id": "v_adult_1", "locale": "en_US", "gender": "male", "age": "adult", "energy": 0.5},
+        {"id": "v_adult_2", "locale": "en_US", "gender": "male", "age": "adult", "energy": 0.5},
+        {"id": "v_elderly", "locale": "en_US", "gender": "male", "age": "elderly", "energy": 0.5},
+    ]
+    p = tmp_path / "en_US.json"
+    p.write_text(json.dumps(pool), encoding="utf-8")
+    mapper = VoiceMapper(voices_path=p)
+
+    c_broad = Character(
+        canonical_id="Character_A",
+        name="Broad",
+        gender_hint=GenderHint.MALE,
+        age_hint=AgeHint.CHILD,
+    )
+    c_elderly = Character(
+        canonical_id="Character_B",
+        name="Elder",
+        gender_hint=GenderHint.MALE,
+        age_hint=AgeHint.ELDERLY,
+    )
+
+    mapping = mapper.assign_all([c_broad, c_elderly])
+    assert mapping["Character_B"].voice_id == "v_elderly"
+    assert mapping["Character_A"].voice_id in {"v_adult_1", "v_adult_2"}
+
+
+def test_assign_all_is_order_independent(tmp_path: Path) -> None:
+    """assign_all produces identical mappings regardless of input roster order."""
+    pool = [
+        {"id": f"v{i}", "locale": "en_US", "gender": "male", "age": "adult", "energy": 0.5}
+        for i in range(5)
+    ]
+    p = tmp_path / "en_US.json"
+    p.write_text(json.dumps(pool), encoding="utf-8")
+
+    chars = [
+        Character(canonical_id=f"Character_{letter}", name=letter, gender_hint=GenderHint.MALE)
+        for letter in "ABCDE"
+    ]
+
+    m1 = VoiceMapper(voices_path=p).assign_all(chars)
+    m2 = VoiceMapper(voices_path=p).assign_all(list(reversed(chars)))
+
+    assert {k: v.voice_id for k, v in m1.items()} == {k: v.voice_id for k, v in m2.items()}
+
 
 
