@@ -477,3 +477,124 @@ def test_delete_book_not_found(client: TestClient, monkeypatch: pytest.MonkeyPat
     r = client.delete("/book/999")
     assert r.status_code == 404
 
+
+def test_generate_audiobook_persists_uploaded_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """POST /generate saves uploaded file to persistent AudioBard/books storage."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        response = client.post("/generate", json=_generate_payload("session-persist"))
+
+    assert response.status_code == 200, response.text
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted_file = books_dir / "book.txt"
+    assert persisted_file.exists()
+    assert persisted_file.read_bytes() == b"book-content"
+
+
+def test_regenerate_book_succeeds_for_uploaded_book(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /book/{id}/regenerate finds the book in persistent storage and starts pipeline."""
+    books_dir = tmp_path / "AudioBard" / "books"
+    books_dir.mkdir(parents=True)
+    source_file = books_dir / "persisted_novel.txt"
+    source_file.write_text("Chapter 1: It was the best of times.", encoding="utf-8")
+
+    fake_book = {"id": 42, "path": str(source_file), "title": "Persisted Novel"}
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda _id: fake_book if _id == 42 else None
+    )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(return_value=None)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r = client.post("/book/42/regenerate", json={"session_id": "regen-success"})
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "started"
+
+
+def test_delete_book_removes_uploaded_source_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /book/{id} removes stored book file when it resides inside books_dir."""
+    books_dir = tmp_path / "AudioBard" / "books"
+    books_dir.mkdir(parents=True)
+    uploaded_source = books_dir / "uploaded_book.epub"
+    uploaded_source.write_bytes(b"epub-content")
+
+    audio_dir = tmp_path / "AudioBard" / "output"
+    audio_dir.mkdir(parents=True)
+    audio_file = audio_dir / "uploaded_book.mp3"
+    audio_file.write_bytes(b"audio-content")
+
+    fake_book = {
+        "id": 5,
+        "path": str(uploaded_source),
+        "title": "Uploaded Book",
+    }
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 5 else None
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    class DummyPersistence:
+        def delete_book(self, _bid: int) -> bool:
+            return True
+
+    monkeypatch.setattr("audiobard.api._get_persistence", lambda: DummyPersistence())
+
+    r = client.delete("/book/5")
+    assert r.status_code == 200
+    assert not audio_file.exists()
+    assert not uploaded_source.exists()
+
+
+def test_delete_book_preserves_external_source_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /book/{id} does not delete external source files outside books_dir."""
+    external_dir = tmp_path / "external_library"
+    external_dir.mkdir(parents=True)
+    external_source = external_dir / "my_precious_book.epub"
+    external_source.write_bytes(b"important-user-file")
+
+    audio_dir = tmp_path / "AudioBard" / "output"
+    audio_dir.mkdir(parents=True)
+    audio_file = audio_dir / "my_precious_book.mp3"
+    audio_file.write_bytes(b"audio-content")
+
+    fake_book = {
+        "id": 6,
+        "path": str(external_source),
+        "title": "Precious Book",
+    }
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 6 else None
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    class DummyPersistence:
+        def delete_book(self, _bid: int) -> bool:
+            return True
+
+    monkeypatch.setattr("audiobard.api._get_persistence", lambda: DummyPersistence())
+
+    r = client.delete("/book/6")
+    assert r.status_code == 200
+    assert not audio_file.exists()
+    assert external_source.exists()
+
+

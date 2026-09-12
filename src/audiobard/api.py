@@ -117,6 +117,58 @@ def _get_book_by_id(book_id: int) -> dict[str, Any] | None:
     return None
 
 
+def _get_books_dir() -> Path:
+    """Return the persistent directory for uploaded books, ensuring it exists."""
+    books_dir = Path.home() / "AudioBard" / "books"
+    books_dir.mkdir(parents=True, exist_ok=True)
+    return books_dir
+
+
+def _get_output_dir() -> Path:
+    """Return the output directory for generated audiobooks, ensuring it exists."""
+    output_dir = Path.home() / "AudioBard" / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> Path:
+    """Write uploaded book bytes atomically into books_dir."""
+    input_path = books_dir / clean_name
+    with tempfile.NamedTemporaryFile(
+        dir=books_dir,
+        prefix=f".{clean_name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_input:
+        temp_input_path = Path(temp_input.name)
+
+    try:
+        temp_input_path.write_bytes(file_bytes)
+        temp_input_path.replace(input_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp_input_path.unlink(missing_ok=True)
+        raise
+    return input_path
+
+
+def _cleanup_book_files(book: dict[str, Any]) -> None:
+    """Remove generated audio file and stored uploaded book if present."""
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
+    if output_path.exists():
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+
+    books_dir = _get_books_dir()
+    if book.get("path"):
+        source_path = Path(book["path"]).resolve()
+        with contextlib.suppress(ValueError, OSError):
+            if source_path.is_relative_to(books_dir.resolve()) and source_path.is_file():
+                source_path.unlink()
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check — Tauri queries this on startup."""
@@ -169,7 +221,7 @@ async def cancel_generation(request: dict[str, Any]) -> dict[str, str]:
 async def get_library() -> list[dict[str, Any]]:
     """Return all generated books with metadata."""
     books = _get_all_books()
-    output_dir = Path.home() / "AudioBard" / "output"
+    output_dir = _get_output_dir()
     result = []
     for book in books:
         stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
@@ -214,8 +266,9 @@ async def download_book(book_id: int) -> FileResponse:
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
     # Reconstruct output path (same logic as generate_audiobook)
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
     return FileResponse(
@@ -231,8 +284,9 @@ async def get_book_path(book_id: int) -> dict[str, str]:
     book = _get_book_by_id(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found on disk")
     return {"path": str(output_path)}
@@ -245,11 +299,7 @@ async def delete_book(book_id: int) -> dict[str, str]:
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
-    if output_path.exists():
-        with contextlib.suppress(OSError):
-            output_path.unlink()
+    await asyncio.to_thread(_cleanup_book_files, book)
 
     manager = _get_persistence()
     manager.delete_book(book_id)
@@ -277,8 +327,7 @@ async def regenerate_book(book_id: int, request: dict[str, Any]) -> dict[str, st
     tts_provider = cast(TTSChoice, str(request.get("tts_provider", "piper")))
     locale = str(request.get("locale", "en_US"))
 
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _get_output_dir()
     output_path = output_dir / f"{source_path.stem}.mp3"
 
     config = AudioBardConfig(
@@ -342,11 +391,15 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
         raw_b64 = file_base64.split(",")[1] if "," in file_base64 else file_base64
         file_bytes = base64.b64decode(raw_b64)
 
+        clean_name = Path(file_name).name.strip()
+        if not clean_name or clean_name in {".", ".."}:
+            clean_name = f"book_{session_id}.txt"
+
+        books_dir = _get_books_dir()
+        input_path = await asyncio.to_thread(_save_uploaded_book, books_dir, clean_name, file_bytes)
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            input_path = tmp_path / file_name
-            input_path.write_bytes(file_bytes)
-
             output_dir = tmp_path / "output"
             output_dir.mkdir()
 
@@ -399,8 +452,7 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
                     detail="Audiobook generation failed - output file not found",
                 )
 
-            permanent_dir = Path.home() / "AudioBard" / "output"
-            permanent_dir.mkdir(parents=True, exist_ok=True)
+            permanent_dir = _get_output_dir()
             permanent_path = permanent_dir / output_path.name
             # shutil.copy2 in this thread pool keeps the sidecar responsive.
             await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
