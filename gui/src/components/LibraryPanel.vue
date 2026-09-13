@@ -33,6 +33,10 @@ watch(() => generationStore.stage, (newStage) => {
   }
 })
 
+watch(() => settingsStore.settings.outputFolder, () => {
+  loadLibrary()
+})
+
 async function loadLibrary() {
   loading.value = true
   error.value = null

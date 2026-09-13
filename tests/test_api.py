@@ -667,10 +667,12 @@ async def test_regenerate_book_custom_output_folder(
         "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 1 else None
     )
 
+    run_event = asyncio.Event()
     captured_out: list[Path] = []
 
     async def _capture_run(src: Path, out: Path, **kwargs: Any) -> None:
         captured_out.append(out)
+        run_event.set()
 
     fake_pipeline = MagicMock()
     fake_pipeline.run = AsyncMock(side_effect=_capture_run)
@@ -680,7 +682,7 @@ async def test_regenerate_book_custom_output_folder(
         patch("audiobard.api.AudioBardConfig"),
     ):
         result = await regenerate_book(1, {"output_folder": str(custom_dir)})
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(run_event.wait(), timeout=2.0)
 
     assert result["status"] == "started"
     assert len(captured_out) == 1
