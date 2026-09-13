@@ -147,6 +147,8 @@ def _find_audio_file(stem: str, custom_output: str | Path | None = None) -> Path
 def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> Path:
     """Write uploaded book bytes atomically into books_dir."""
     input_path = books_dir / clean_name
+    if input_path.exists():
+        raise FileExistsError(f"Destination file already exists: {input_path}")
     with tempfile.NamedTemporaryFile(
         dir=books_dir,
         prefix=f".{clean_name}.",
@@ -157,6 +159,8 @@ def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> 
 
     try:
         temp_input_path.write_bytes(file_bytes)
+        if input_path.exists():
+            raise FileExistsError(f"Destination file already exists: {input_path}")
         temp_input_path.replace(input_path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -175,10 +179,17 @@ def _delete_book_source(source_path: Path) -> None:
 
 
 def _update_book_title(path: Path, title: str) -> None:
-    """Update book title in persistence for the given path."""
+    """Update book title in persistence, cleaning up older superseded duplicates."""
     persistence = _get_persistence()
     path_str = str(path.resolve())
     with persistence._get_conn() as conn:
+        old_rows = conn.execute(
+            "SELECT id, path, title FROM books WHERE title = ? AND path != ?",
+            (title, path_str),
+        ).fetchall()
+        for old in old_rows:
+            _cleanup_book_files(dict(old))
+            conn.execute("DELETE FROM books WHERE id = ?", (old["id"],))
         conn.execute("UPDATE books SET title = ? WHERE path = ?", (title, path_str))
         conn.commit()
 
@@ -445,7 +456,7 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
         if not safe_suffix.startswith("."):
             safe_suffix = f".{safe_suffix}"
 
-        unique_upload_id = uuid.uuid4().hex[:8]
+        unique_upload_id = uuid.uuid4().hex
         unique_filename = f"{safe_stem}_{unique_upload_id}{safe_suffix}"
 
         books_dir = _get_books_dir()
