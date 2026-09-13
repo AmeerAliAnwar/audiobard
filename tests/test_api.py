@@ -717,5 +717,68 @@ def test_generate_audiobook_preserves_display_title(
     assert books[0]["title"] == "Alice's Adventures in Wonderland"
 
 
+def test_repeated_upload_registering_pipeline_cleans_superseded_files(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Repeated uploads with registering pipeline clean up older source, output, and db record."""
+    from audiobard.api import _get_persistence
+    from audiobard.parser.base import ParserStats
+
+    async def _registering_pipeline_run(
+        input_path: Path, output_path: Path, **_kwargs: Any
+    ) -> None:
+        _stub_pipeline_run(input_path, output_path)
+        persistence = _get_persistence()
+        persistence.get_or_create_book(
+            input_path,
+            input_path.stem,
+            ParserStats(total_paragraphs=10, total_words=100, dialog_ratio=0.1),
+        )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_registering_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r1 = client.post("/generate", json=_generate_payload("session-rep-1"))
+        assert r1.status_code == 200
+        out1 = Path(r1.json()["output_path"])
+        assert out1.exists()
+
+        books_dir = tmp_path / "AudioBard" / "books"
+        source_files_1 = list(books_dir.glob("book_*.txt"))
+        assert len(source_files_1) == 1
+
+        # Second upload with the same book title/file_name
+        r2 = client.post("/generate", json=_generate_payload("session-rep-2"))
+        assert r2.status_code == 200
+        out2 = Path(r2.json()["output_path"])
+        assert out2.exists()
+        assert out1 != out2
+
+        # The superseded first output file and source file should be cleaned up
+        assert not out1.exists()
+        source_files_2 = list(books_dir.glob("book_*.txt"))
+        assert len(source_files_2) == 1
+        assert source_files_2[0] != source_files_1[0]
+
+        # Library should have only the active, single book record
+        r_lib = client.get("/library")
+        assert r_lib.status_code == 200
+        books = r_lib.json()
+        assert len(books) == 1
+        assert books[0]["title"] == "book"
+
+        # Deleting the book removes the active files and leaves zero orphans
+        del_resp = client.delete(f"/book/{books[0]['id']}")
+        assert del_resp.status_code == 200
+        assert not out2.exists()
+        assert list(books_dir.glob("book_*.txt")) == []
+
+
+
 
 
