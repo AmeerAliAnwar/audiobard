@@ -117,6 +117,94 @@ def _get_book_by_id(book_id: int) -> dict[str, Any] | None:
     return None
 
 
+def _get_books_dir() -> Path:
+    """Return the persistent directory for uploaded books, ensuring it exists."""
+    books_dir = Path.home() / "AudioBard" / "books"
+    books_dir.mkdir(parents=True, exist_ok=True)
+    return books_dir
+
+
+def _get_output_dir() -> Path:
+    """Return the output directory for generated audiobooks, ensuring it exists."""
+    output_dir = Path.home() / "AudioBard" / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _save_uploaded_book(books_dir: Path, clean_name: str, file_bytes: bytes) -> Path:
+    """Write uploaded book bytes atomically into books_dir."""
+    input_path = books_dir / clean_name
+    if input_path.exists():
+        raise FileExistsError(f"Destination file already exists: {input_path}")
+    with tempfile.NamedTemporaryFile(
+        dir=books_dir,
+        prefix=f".{clean_name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_input:
+        temp_input_path = Path(temp_input.name)
+
+    try:
+        temp_input_path.write_bytes(file_bytes)
+        if input_path.exists():
+            raise FileExistsError(f"Destination file already exists: {input_path}")
+        temp_input_path.replace(input_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp_input_path.unlink(missing_ok=True)
+        raise
+    return input_path
+
+
+def _delete_book_source(source_path: Path) -> None:
+    """Remove stored book file if inside books_dir."""
+    books_dir = _get_books_dir().resolve()
+    resolved = source_path.resolve()
+    with contextlib.suppress(ValueError, OSError):
+        if resolved.is_relative_to(books_dir) and resolved.is_file():
+            resolved.unlink(missing_ok=True)
+
+
+def _update_book_title(path: Path, title: str) -> None:
+    """Update book title in persistence, cleaning up older superseded duplicates."""
+    persistence = _get_persistence()
+    path_str = str(path.resolve())
+    with persistence._get_conn() as conn:
+        old_rows = conn.execute(
+            "SELECT id, path, title FROM books WHERE title = ? AND path != ?",
+            (title, path_str),
+        ).fetchall()
+        for old in old_rows:
+            _cleanup_book_files(dict(old))
+            conn.execute("DELETE FROM books WHERE id = ?", (old["id"],))
+        conn.execute("UPDATE books SET title = ? WHERE path = ?", (title, path_str))
+        conn.commit()
+
+
+def _is_book_registered(path: Path) -> bool:
+    """Check if a book record exists in persistence for the given path."""
+    persistence = _get_persistence()
+    path_str = str(path.resolve())
+    with persistence._get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM books WHERE path = ?", (path_str,)
+        ).fetchone()
+        return row is not None
+
+
+def _cleanup_book_files(book: dict[str, Any]) -> None:
+    """Remove generated audio file and stored uploaded book if present."""
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
+    if output_path.exists():
+        with contextlib.suppress(OSError):
+            output_path.unlink()
+
+    if book.get("path"):
+        _delete_book_source(Path(book["path"]))
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check — Tauri queries this on startup."""
@@ -169,7 +257,7 @@ async def cancel_generation(request: dict[str, Any]) -> dict[str, str]:
 async def get_library() -> list[dict[str, Any]]:
     """Return all generated books with metadata."""
     books = _get_all_books()
-    output_dir = Path.home() / "AudioBard" / "output"
+    output_dir = _get_output_dir()
     result = []
     for book in books:
         stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
@@ -214,8 +302,9 @@ async def download_book(book_id: int) -> FileResponse:
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
     # Reconstruct output path (same logic as generate_audiobook)
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
     return FileResponse(
@@ -231,8 +320,9 @@ async def get_book_path(book_id: int) -> dict[str, str]:
     book = _get_book_by_id(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
+    output_dir = _get_output_dir()
+    stem = Path(book["path"]).stem if book.get("path") else f"book_{book['id']}"
+    output_path = output_dir / f"{stem}.mp3"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found on disk")
     return {"path": str(output_path)}
@@ -245,11 +335,7 @@ async def delete_book(book_id: int) -> dict[str, str]:
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_path = output_dir / f"{Path(book['path']).stem}.mp3"
-    if output_path.exists():
-        with contextlib.suppress(OSError):
-            output_path.unlink()
+    await asyncio.to_thread(_cleanup_book_files, book)
 
     manager = _get_persistence()
     manager.delete_book(book_id)
@@ -277,8 +363,7 @@ async def regenerate_book(book_id: int, request: dict[str, Any]) -> dict[str, st
     tts_provider = cast(TTSChoice, str(request.get("tts_provider", "piper")))
     locale = str(request.get("locale", "en_US"))
 
-    output_dir = Path.home() / "AudioBard" / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _get_output_dir()
     output_path = output_dir / f"{source_path.stem}.mp3"
 
     config = AudioBardConfig(
@@ -342,69 +427,94 @@ async def generate_audiobook(request: dict[str, Any]) -> dict[str, str]:
         raw_b64 = file_base64.split(",")[1] if "," in file_base64 else file_base64
         file_bytes = base64.b64decode(raw_b64)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            input_path = tmp_path / file_name
-            input_path.write_bytes(file_bytes)
+        clean_name = Path(file_name).name.strip()
+        raw_stem = Path(clean_name).stem.strip() or "book"
+        display_title = raw_stem
+        safe_stem = (
+            "".join(c for c in raw_stem if c.isalnum() or c in ("-", "_")).strip("._")
+            or "book"
+        )
+        raw_suffix = Path(clean_name).suffix if clean_name else ".txt"
+        safe_suffix = "".join(c for c in raw_suffix if c.isalnum() or c == ".").strip() or ".txt"
+        if not safe_suffix.startswith("."):
+            safe_suffix = f".{safe_suffix}"
 
-            output_dir = tmp_path / "output"
-            output_dir.mkdir()
+        unique_upload_id = uuid.uuid4().hex
+        unique_filename = f"{safe_stem}_{unique_upload_id}{safe_suffix}"
 
-            config = AudioBardConfig(
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                llm_base_url=str(request.get("llm_base_url") or "http://localhost:11434"),
-                openrouter_api_key=str(request.get("openrouter_api_key") or ""),
-                gemini_api_key=str(request.get("gemini_api_key") or ""),
-                nim_api_key=str(request.get("nim_api_key") or ""),
-                tts_provider=tts_provider,
-                tts_locale=locale,
-            )
-            pipeline = AudioBookPipeline(config)
+        books_dir = _get_books_dir()
+        input_path = await asyncio.to_thread(
+            _save_uploaded_book, books_dir, unique_filename, file_bytes
+        )
 
-            output_path = output_dir / f"{input_path.stem}.mp3"
+        book_registered = False
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                output_dir = tmp_path / "output"
+                output_dir.mkdir()
 
-            # Mark the session as running before we await the pipeline so
-            # the first poll (which may already be in flight on the Tauri
-            # side) sees a non-zero state instead of an idle placeholder.
-            progress_store.update(
-                session_id,
-                PipelineProgress(stage="queued", percent=0, message="Starting"),
-            )
+                config = AudioBardConfig(
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    llm_base_url=str(request.get("llm_base_url") or "http://localhost:11434"),
+                    openrouter_api_key=str(request.get("openrouter_api_key") or ""),
+                    gemini_api_key=str(request.get("gemini_api_key") or ""),
+                    nim_api_key=str(request.get("nim_api_key") or ""),
+                    tts_provider=tts_provider,
+                    tts_locale=locale,
+                )
+                pipeline = AudioBookPipeline(config)
 
-            def on_progress(progress: PipelineProgress) -> None:
-                progress_store.update(session_id, progress)
-                if progress_store.is_cancelled(session_id):
-                    raise asyncio.CancelledError()
+                output_path = output_dir / f"{input_path.stem}.mp3"
 
-            try:
-                await pipeline.run(input_path, output_path, progress_callback=on_progress)
-            except asyncio.CancelledError:
+                # Mark the session as running before we await the pipeline so
+                # the first poll (which may already be in flight on the Tauri
+                # side) sees a non-zero state instead of an idle placeholder.
                 progress_store.update(
                     session_id,
-                    PipelineProgress(
-                        stage="cancelled",
-                        percent=0,
-                        message="Cancelled by user",
-                    ),
-                )
-                raise HTTPException(
-                    status_code=499,
-                    detail="Generation cancelled by user",
-                ) from None
-
-            if not output_path.exists():
-                raise HTTPException(
-                    status_code=500,
-                    detail="Audiobook generation failed - output file not found",
+                    PipelineProgress(stage="queued", percent=0, message="Starting"),
                 )
 
-            permanent_dir = Path.home() / "AudioBard" / "output"
-            permanent_dir.mkdir(parents=True, exist_ok=True)
-            permanent_path = permanent_dir / output_path.name
-            # shutil.copy2 in this thread pool keeps the sidecar responsive.
-            await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
-            return {"session_id": session_id, "output_path": str(permanent_path)}
+                def on_progress(progress: PipelineProgress) -> None:
+                    progress_store.update(session_id, progress)
+                    if progress_store.is_cancelled(session_id):
+                        raise asyncio.CancelledError()
+
+                try:
+                    await pipeline.run(input_path, output_path, progress_callback=on_progress)
+                except asyncio.CancelledError:
+                    progress_store.update(
+                        session_id,
+                        PipelineProgress(
+                            stage="cancelled",
+                            percent=0,
+                            message="Cancelled by user",
+                        ),
+                    )
+                    raise HTTPException(
+                        status_code=499,
+                        detail="Generation cancelled by user",
+                    ) from None
+
+                if not output_path.exists():
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Audiobook generation failed - output file not found",
+                    )
+
+                permanent_dir = _get_output_dir()
+                permanent_path = permanent_dir / output_path.name
+                # shutil.copy2 in this thread pool keeps the sidecar responsive.
+                await asyncio.to_thread(shutil.copy2, output_path, permanent_path)
+                book_registered = True
+                await asyncio.to_thread(_update_book_title, input_path, display_title)
+                return {"session_id": session_id, "output_path": str(permanent_path)}
+        finally:
+            if not book_registered:
+                is_reg = await asyncio.to_thread(_is_book_registered, input_path)
+                if not is_reg:
+                    await asyncio.to_thread(_delete_book_source, input_path)
 
     except HTTPException:
         raise
