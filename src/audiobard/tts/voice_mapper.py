@@ -3,19 +3,29 @@
 Algorithm
 ---------
 1. Load the voice pool for the configured locale (``data/voices/en_US.json``).
-2. For each :class:`~audiobard.models.Character`:
+2. For whole-roster assignment (:meth:`VoiceMapper.assign_all`):
+   a. Order unmapped characters by candidate pool constraint
+      (most constrained pool first, tie-broken by ``canonical_id``). This ensures
+      rare demographic matches are assigned first and produces identical results
+      regardless of input roster permutation.
+3. For each :class:`~audiobard.models.Character`:
    a. Filter the pool by ``gender_hint`` (mandatory).
    b. Further filter by ``age_hint`` (best-effort; fall back to gender-filtered pool if empty).
    c. Score remaining candidates by cosine similarity of the tone vector.
-   d. Deterministic tie-break: ``zlib.crc32(canonical_id) % len(candidate_pool)``,
-      stable across processes (built-in ``hash()`` is salted per process).
-   e. If even the gender-filtered pool is empty, assign from the full pool
-      via the same hash tie-break and log a warning.
-3. Save the resulting mapping to ``voice_mapping.json`` (versioned).
+   d. Prioritize voice uniqueness: candidates not yet assigned in the current
+      mapping (``_mapping``) are selected from the highest available similarity
+      tier. If all matching candidates are already assigned, voices are reused
+      from the top similarity tier.
+   e. Deterministic tie-break: candidates within a tier are sorted by
+      ``(zlib.crc32(canonical_id + voice_id), voice_id)``, stable across processes
+      and platforms (unlike Python's salted ``hash()``).
+   f. If even the gender-filtered pool is empty, assign from the full pool
+      and log a warning.
+4. Save the resulting mapping to ``voice_mapping.json`` (versioned).
 
-The assignment is **fully deterministic**: given the same voice pool and
-character list the output is always identical, enabling reproducible tests and
-pipeline resumability.
+The whole-roster assignment (:meth:`~VoiceMapper.assign_all`) is **fully deterministic**
+and roster-order independent: given the same voice pool and character set, the output
+is always identical, enabling reproducible tests and pipeline resumability.
 """
 
 from __future__ import annotations
@@ -138,8 +148,9 @@ class VoiceMapper:
     def assign(self, character: Character) -> VoiceAssignment:
         """Return (and cache) a :class:`VoiceAssignment` for *character*.
 
-        The result is deterministic: the same character always maps to the
-        same voice given the same pool.
+        Assignments prioritize voice uniqueness against previously assigned
+        characters in this mapper. For whole-roster allocation that canonicalizes
+        assignment order and prioritizes constrained pools, use :meth:`assign_all`.
         """
         if character.canonical_id in self._mapping:
             return self._mapping[character.canonical_id]
@@ -149,8 +160,17 @@ class VoiceMapper:
         return assignment
 
     def assign_all(self, characters: list[Character]) -> dict[str, VoiceAssignment]:
-        """Assign voices to a list of characters, returning the full mapping."""
-        for char in characters:
+        """Assign voices to a list of characters, returning the full mapping.
+
+        Sorts unmapped characters to allocate constrained candidate pools first
+        and canonicalizes by ID for strict determinism independent of input order.
+        """
+        unmapped = [c for c in characters if c.canonical_id not in self._mapping]
+        sorted_chars = sorted(
+            unmapped,
+            key=lambda c: (len(self._candidate_pool_for(c)), c.canonical_id),
+        )
+        for char in sorted_chars:
             self.assign(char)
         return dict(self._mapping)
 
@@ -200,8 +220,8 @@ class VoiceMapper:
             raise ValueError(f"Voice pool is empty: {self.voices_path}")
         logger.debug("Loaded %d voices from %s", len(self._pool), self.voices_path)
 
-    def _compute_assignment(self, character: Character) -> VoiceAssignment:
-        # Step 1: filter by gender_hint (mandatory when available)
+    def _candidate_pool_for(self, character: Character) -> list[Voice]:
+        """Return candidate voices for *character* filtered by gender and age hints."""
         effective_gender = character.gender_hint
         if effective_gender == GenderHint.NEUTRAL:
             # Whole-word clues only — substring "man"/"he" mis-gendered Amanda/Michelle (#79).
@@ -221,15 +241,17 @@ class VoiceMapper:
                 )
             gender_pool = list(self._pool)
 
-        # Step 2: filter by age_hint (best-effort)
         age_pool = [v for v in gender_pool if v.age == character.age_hint]
-        candidate_pool = age_pool if age_pool else gender_pool
         if not age_pool:
             logger.debug(
                 "No voices matching age_hint=%s for %s; falling back to gender pool.",
                 character.age_hint,
                 character.canonical_id,
             )
+        return age_pool if age_pool else gender_pool
+
+    def _compute_assignment(self, character: Character) -> VoiceAssignment:
+        candidate_pool = self._candidate_pool_for(character)
 
         # Step 3: score by cosine similarity to tone vector
         tone_vec = _TONE_VECTORS.get(character.tone.value, _TONE_VECTORS[Tone.NEUTRAL.value])
@@ -239,12 +261,30 @@ class VoiceMapper:
         ]
         scored.sort(key=lambda x: (-x[0], x[1]))  # descending similarity, stable by index
 
-        # Step 4: deterministic tie-break among top-scoring voices
-        top_score = scored[0][0]
-        top_voices = [v for score, _, v in scored if abs(score - top_score) < 1e-9]
-        chosen = top_voices[
-            zlib.crc32(character.canonical_id.encode("utf-8")) % len(top_voices)
+        # Step 4: deterministic tie-break prioritizing voice uniqueness across characters
+        assigned_voice_ids = {asmt.voice_id for asmt in self._mapping.values()}
+
+        unused_candidates = [
+            (score, v) for score, _, v in scored if v.id not in assigned_voice_ids
         ]
+        if unused_candidates:
+            best_unused_score = unused_candidates[0][0]
+            pool_to_pick = [
+                v for score, v in unused_candidates if abs(score - best_unused_score) < 1e-9
+            ]
+        else:
+            top_score = scored[0][0]
+            pool_to_pick = [v for score, _, v in scored if abs(score - top_score) < 1e-9]
+
+        chosen = min(
+            pool_to_pick,
+            key=lambda v: (
+                zlib.crc32(
+                    character.canonical_id.encode("utf-8") + v.id.encode("utf-8")
+                ),
+                v.id,
+            ),
+        )
 
         return VoiceAssignment(
             canonical_id=character.canonical_id,

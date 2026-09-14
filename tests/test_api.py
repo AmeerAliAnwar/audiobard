@@ -20,6 +20,16 @@ def _clear_progress_store() -> None:
     progress_store.clear_state_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_audiobard_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_home = tmp_path_factory.mktemp("audiobard_test_home")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    test_db = fake_home / "test_audiobard.db"
+    monkeypatch.setenv("AUDIOBARD_DB_PATH", str(test_db))
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
@@ -117,7 +127,8 @@ def test_generate_audiobook_success(client: TestClient, tmp_path: Path) -> None:
     body = response.json()
     assert body["session_id"] == "session-A"
     assert "output_path" in body
-    assert Path(body["output_path"]).name == "book.mp3"
+    assert Path(body["output_path"]).name.startswith("book_")
+    assert Path(body["output_path"]).suffix == ".mp3"
     # Pipeline should have been invoked with a progress callback that
     # updates the store for the same session.
     fake_pipeline.run.assert_awaited_once()
@@ -500,9 +511,10 @@ def test_generate_audiobook_custom_output_folder(client: TestClient, tmp_path: P
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["session_id"] == "session-custom-out"
-    expected_path = custom_dir / "book.mp3"
-    assert Path(body["output_path"]).resolve() == expected_path.resolve()
-    assert expected_path.exists()
+    out_path = Path(body["output_path"])
+    assert out_path.parent.resolve() == custom_dir.resolve()
+    assert out_path.name.startswith("book_")
+    assert out_path.exists()
 
 
 def test_get_library_custom_output_folder(
@@ -687,3 +699,293 @@ async def test_regenerate_book_custom_output_folder(
     assert result["status"] == "started"
     assert len(captured_out) == 1
     assert captured_out[0].resolve() == (custom_dir / "book.mp3").resolve()
+
+
+def test_generate_audiobook_persists_uploaded_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """POST /generate saves uploaded file to persistent AudioBard/books storage."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        response = client.post("/generate", json=_generate_payload("session-persist"))
+
+    assert response.status_code == 200, response.text
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted = list(books_dir.glob("book_*.txt"))
+    assert len(persisted) == 1
+    assert persisted[0].read_bytes() == b"book-content"
+    body = response.json()
+    assert Path(body["output_path"]).stem == persisted[0].stem
+
+
+def test_regenerate_book_succeeds_for_uploaded_book(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /book/{id}/regenerate finds the book in persistent storage and starts pipeline."""
+    books_dir = tmp_path / "AudioBard" / "books"
+    books_dir.mkdir(parents=True)
+    source_file = books_dir / "persisted_novel.txt"
+    source_file.write_text("Chapter 1: It was the best of times.", encoding="utf-8")
+
+    fake_book = {"id": 42, "path": str(source_file), "title": "Persisted Novel"}
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda _id: fake_book if _id == 42 else None
+    )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(return_value=None)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r = client.post("/book/42/regenerate", json={"session_id": "regen-success"})
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "started"
+
+
+def test_delete_book_removes_uploaded_source_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /book/{id} removes stored book file when it resides inside books_dir."""
+    books_dir = tmp_path / "AudioBard" / "books"
+    books_dir.mkdir(parents=True)
+    uploaded_source = books_dir / "uploaded_book.epub"
+    uploaded_source.write_bytes(b"epub-content")
+
+    audio_dir = tmp_path / "AudioBard" / "output"
+    audio_dir.mkdir(parents=True)
+    audio_file = audio_dir / "uploaded_book.mp3"
+    audio_file.write_bytes(b"audio-content")
+
+    fake_book = {
+        "id": 5,
+        "path": str(uploaded_source),
+        "title": "Uploaded Book",
+    }
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 5 else None
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    class DummyPersistence:
+        def delete_book(self, _bid: int) -> bool:
+            return True
+
+    monkeypatch.setattr("audiobard.api._get_persistence", lambda: DummyPersistence())
+
+    r = client.delete("/book/5")
+    assert r.status_code == 200
+    assert not audio_file.exists()
+    assert not uploaded_source.exists()
+
+
+def test_delete_book_preserves_external_source_file(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /book/{id} does not delete external source files outside books_dir."""
+    external_dir = tmp_path / "external_library"
+    external_dir.mkdir(parents=True)
+    external_source = external_dir / "my_precious_book.epub"
+    external_source.write_bytes(b"important-user-file")
+
+    audio_dir = tmp_path / "AudioBard" / "output"
+    audio_dir.mkdir(parents=True)
+    audio_file = audio_dir / "my_precious_book.mp3"
+    audio_file.write_bytes(b"audio-content")
+
+    fake_book = {
+        "id": 6,
+        "path": str(external_source),
+        "title": "Precious Book",
+    }
+    monkeypatch.setattr(
+        "audiobard.api._get_book_by_id", lambda bid: fake_book if bid == 6 else None
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    class DummyPersistence:
+        def delete_book(self, _bid: int) -> bool:
+            return True
+
+    monkeypatch.setattr("audiobard.api._get_persistence", lambda: DummyPersistence())
+
+    r = client.delete("/book/6")
+    assert r.status_code == 200
+    assert not audio_file.exists()
+    assert external_source.exists()
+
+
+def test_generate_audiobook_unregistered_failure_cleans_up_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """When pipeline raises before registering the book, orphan upload file is removed."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=ValueError("corrupt book content"))
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        response = client.post("/generate", json=_generate_payload("session-fail-cleanup"))
+
+    assert response.status_code == 500
+    books_dir = tmp_path / "AudioBard" / "books"
+    if books_dir.exists():
+        assert list(books_dir.glob("book_*.txt")) == []
+
+
+def test_generate_audiobook_unique_filenames_no_collision(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Repeated uploads of the same filename produce distinct source files and output paths."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r1 = client.post("/generate", json=_generate_payload("session-1"))
+        r2 = client.post("/generate", json=_generate_payload("session-2"))
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    p1 = r1.json()["output_path"]
+    p2 = r2.json()["output_path"]
+    assert p1 != p2
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted = list(books_dir.glob("book_*.txt"))
+    assert len(persisted) == 2
+    assert persisted[0] != persisted[1]
+
+
+def test_generate_audiobook_sanitizes_path_traversal(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Path traversal in filename and session_id is safely contained within books_dir."""
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        payload = _generate_payload()
+        payload["file_name"] = "../../evil.txt"
+        payload["session_id"] = "../../escape_id"
+        response = client.post("/generate", json=payload)
+
+    assert response.status_code == 200
+    books_dir = tmp_path / "AudioBard" / "books"
+    persisted = list(books_dir.glob("evil_*.txt"))
+    assert len(persisted) == 1
+    assert persisted[0].parent.resolve() == books_dir.resolve()
+
+
+def test_generate_audiobook_preserves_display_title(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Original book stem with punctuation and spaces is preserved in persistence."""
+    from audiobard.api import _get_persistence
+    from audiobard.parser.base import ParserStats
+
+    async def _stub_with_db(input_path: Path, output_path: Path, **_kwargs: Any) -> None:
+        _stub_pipeline_run(input_path, output_path)
+        persistence = _get_persistence()
+        persistence.get_or_create_book(
+            input_path,
+            "temporary_title",
+            ParserStats(total_paragraphs=5, total_words=50, dialog_ratio=0.2),
+        )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_stub_with_db)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        payload = _generate_payload("session-title")
+        payload["file_name"] = "Alice's Adventures in Wonderland.txt"
+        response = client.post("/generate", json=payload)
+
+    assert response.status_code == 200
+    r = client.get("/library")
+    assert r.status_code == 200
+    books = r.json()
+    assert len(books) == 1
+    assert books[0]["title"] == "Alice's Adventures in Wonderland"
+
+
+def test_repeated_upload_registering_pipeline_cleans_superseded_files(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Repeated uploads with registering pipeline clean up older source, output, and db record."""
+    from audiobard.api import _get_persistence
+    from audiobard.parser.base import ParserStats
+
+    async def _registering_pipeline_run(
+        input_path: Path, output_path: Path, **_kwargs: Any
+    ) -> None:
+        _stub_pipeline_run(input_path, output_path)
+        persistence = _get_persistence()
+        persistence.get_or_create_book(
+            input_path,
+            input_path.stem,
+            ParserStats(total_paragraphs=10, total_words=100, dialog_ratio=0.1),
+        )
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.run = AsyncMock(side_effect=_registering_pipeline_run)
+
+    with (
+        patch("audiobard.api.AudioBookPipeline", return_value=fake_pipeline),
+        patch("audiobard.api.AudioBardConfig"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        r1 = client.post("/generate", json=_generate_payload("session-rep-1"))
+        assert r1.status_code == 200
+        out1 = Path(r1.json()["output_path"])
+        assert out1.exists()
+
+        books_dir = tmp_path / "AudioBard" / "books"
+        source_files_1 = list(books_dir.glob("book_*.txt"))
+        assert len(source_files_1) == 1
+
+        # Second upload with the same book title/file_name
+        r2 = client.post("/generate", json=_generate_payload("session-rep-2"))
+        assert r2.status_code == 200
+        out2 = Path(r2.json()["output_path"])
+        assert out2.exists()
+        assert out1 != out2
+
+        # The superseded first output file and source file should be cleaned up
+        assert not out1.exists()
+        source_files_2 = list(books_dir.glob("book_*.txt"))
+        assert len(source_files_2) == 1
+        assert source_files_2[0] != source_files_1[0]
+
+        # Library should have only the active, single book record
+        r_lib = client.get("/library")
+        assert r_lib.status_code == 200
+        books = r_lib.json()
+        assert len(books) == 1
+        assert books[0]["title"] == "book"
+
+        # Deleting the book removes the active files and leaves zero orphans
+        del_resp = client.delete(f"/book/{books[0]['id']}")
+        assert del_resp.status_code == 200
+        assert not out2.exists()
+        assert list(books_dir.glob("book_*.txt")) == []
