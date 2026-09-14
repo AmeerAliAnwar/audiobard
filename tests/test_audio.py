@@ -369,3 +369,101 @@ def test_find_ffmpeg_returns_none_when_absent(
         patch("builtins.__import__", side_effect=_block_imageio_import()),
     ):
         assert find_ffmpeg() is None
+
+
+def _create_custom_mp3(
+    duration_ms: int = 100, frame_rate: int = 44100, channels: int = 1
+) -> bytes:
+    """Generate an MP3 audio segment with explicit duration, sample rate, and channels."""
+    raw_data = (b"\x10\x20" * channels) * int(frame_rate * duration_ms / 1000)
+    segment = AudioSegment(
+        data=raw_data, sample_width=2, frame_rate=frame_rate, channels=channels
+    )
+    out = io.BytesIO()
+    segment.export(out, format="mp3")
+    return out.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_audio_processor_concatenate_batch_performance() -> None:
+    """Test that concatenating a large batch of clips produces expected duration linearly."""
+    dummy_mp3 = _create_custom_mp3(duration_ms=50, frame_rate=24000, channels=1)
+    clips = [
+        AudioClip(
+            mp3_bytes=dummy_mp3,
+            speaker=f"Character_{chr(65 + (i % 26))}",
+            emotion=Emotion.NEUTRAL,
+            duration_ms=50,
+        )
+        for i in range(50)
+    ]
+
+    processor = AudioProcessor()
+    with patch.object(
+        AudioSegment, "append", side_effect=AssertionError("unexpected segment append")
+    ):
+        out_bytes = await processor.concatenate(clips)
+    assert len(out_bytes) > 0
+
+    segment = AudioSegment.from_file(io.BytesIO(out_bytes), format="mp3")
+    assert abs(len(segment) - 15000) < 500
+
+
+@pytest.mark.asyncio
+async def test_audio_processor_concatenate_mixed_formats() -> None:
+    """Test that clips with different sample rates and channel counts synchronize properly."""
+    mono_24k = _create_custom_mp3(duration_ms=200, frame_rate=24000, channels=1)
+    stereo_44k = _create_custom_mp3(duration_ms=200, frame_rate=44100, channels=2)
+
+    clips = [
+        AudioClip(
+            mp3_bytes=mono_24k,
+            speaker="Character_A",
+            emotion=Emotion.HAPPY,
+            duration_ms=200,
+        ),
+        AudioClip(
+            mp3_bytes=stereo_44k,
+            speaker="Character_B",
+            emotion=Emotion.NEUTRAL,
+            duration_ms=200,
+        ),
+    ]
+
+    processor = AudioProcessor()
+    out_bytes = await processor.concatenate(clips)
+    assert len(out_bytes) > 0
+
+    segment = AudioSegment.from_file(io.BytesIO(out_bytes), format="mp3")
+    assert abs(len(segment) - 850) < 100
+
+
+@pytest.mark.asyncio
+async def test_audio_processor_concatenate_zero_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that clips with zero-duration emotion pause do not insert silence frames."""
+    from audiobard.tts.base import EMOTION_PROSODY
+
+    monkeypatch.setitem(EMOTION_PROSODY, Emotion.WHISPER, {"rate": 0.9, "pause_after_ms": 0})
+    dummy_mp3 = _create_custom_mp3(duration_ms=300, frame_rate=24000, channels=1)
+
+    clips = [
+        AudioClip(
+            mp3_bytes=dummy_mp3,
+            speaker="Character_A",
+            emotion=Emotion.WHISPER,
+            duration_ms=300,
+        ),
+        AudioClip(
+            mp3_bytes=dummy_mp3,
+            speaker="Character_B",
+            emotion=Emotion.WHISPER,
+            duration_ms=300,
+        ),
+    ]
+
+    processor = AudioProcessor()
+    out_bytes = await processor.concatenate(clips)
+    assert len(out_bytes) > 0
+
+    segment = AudioSegment.from_file(io.BytesIO(out_bytes), format="mp3")
+    assert abs(len(segment) - 600) < 100
